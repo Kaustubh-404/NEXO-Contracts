@@ -4,10 +4,7 @@ version = "1.0.0"
 authors = ["Credit Protocol Team"]
 
 [addresses]
-credit_protocol = "_"
-
-[dev-addresses]
-credit_protocol = "0x7dab2b468867d46e5a1968ffa045d1308b010e6e1eece081172c72c3f35c4f5e"
+credit_protocol = "0x1355c80d440ac62e6837469c1ae59ab5b3493a7ff394d3a3da7eb43090e39007"
 
 [dependencies.AptosFramework]
 git = "https://github.com/aptos-labs/aptos-core.git"

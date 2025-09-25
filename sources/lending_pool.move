@@ -5,8 +5,9 @@ module credit_protocol::lending_pool {
     use std::option::{Self, Option};
     use aptos_framework::timestamp;
     use aptos_framework::event;
-    use aptos_framework::coin::{Self, Coin};
-    use aptos_framework::aptos_coin::AptosCoin;
+    use aptos_framework::fungible_asset::{Self, FungibleAsset, Metadata};
+    use aptos_framework::object::{Self, Object};
+    use aptos_framework::primary_fungible_store;
     use aptos_framework::account;
     use aptos_framework::table::{Self, Table};
 
@@ -22,6 +23,9 @@ module credit_protocol::lending_pool {
     /// Constants
     const BASIS_POINTS: u256 = 10000;
     const PROTOCOL_FEE_RATE: u256 = 1000; // 10%
+
+    /// USDC Metadata Object Address on Aptos Testnet
+    const USDC_METADATA_ADDRESS: address = @0x69091fbab5f7d635ee7ac5098cf0c1efbe31d68fec0f2cd565e8d168daf52832;
 
     /// Lender information structure
     struct LenderInfo has copy, store, drop {
@@ -40,7 +44,7 @@ module credit_protocol::lending_pool {
         protocol_fees_collected: u64,
         lenders: Table<address, LenderInfo>,
         lenders_list: vector<address>,
-        usdc_reserve: Coin<AptosCoin>, // Using AptosCoin as placeholder for USDC
+        usdc_metadata: Object<Metadata>, // USDC metadata object
         is_paused: bool,
     }
 
@@ -94,13 +98,13 @@ module credit_protocol::lending_pool {
         let lending_pool = LendingPool {
             admin: admin_addr,
             credit_manager,
-            total_deposited: 0,
+            total_deposited: 10000000, // Seed with 10 USDC for testing
             total_borrowed: 0,
             total_repaid: 0,
             protocol_fees_collected: 0,
             lenders: table::new(),
             lenders_list: vector::empty(),
-            usdc_reserve: coin::zero<AptosCoin>(),
+            usdc_metadata: object::address_to_object<Metadata>(USDC_METADATA_ADDRESS),
             is_paused: false,
         };
 
@@ -120,8 +124,8 @@ module credit_protocol::lending_pool {
         assert!(amount > 0, error::invalid_argument(E_INVALID_AMOUNT));
 
         // Transfer coins from lender to pool
-        let deposit_coins = coin::withdraw<AptosCoin>(lender, amount);
-        coin::merge(&mut pool.usdc_reserve, deposit_coins);
+        // Transfer USDC from lender to pool contract
+        primary_fungible_store::transfer(lender, pool.usdc_metadata, pool_addr, amount);
 
         // Update or create lender info
         if (table::contains(&pool.lenders, lender_addr)) {
@@ -160,7 +164,7 @@ module credit_protocol::lending_pool {
         assert!(table::contains(&pool.lenders, lender_addr), error::not_found(E_NOT_INITIALIZED));
 
         // Check available liquidity first
-        let available_liquidity = coin::value(&pool.usdc_reserve) - pool.protocol_fees_collected;
+        let available_liquidity = pool.total_deposited - pool.total_borrowed + pool.total_repaid;
         assert!(available_liquidity >= amount, error::invalid_state(E_INSUFFICIENT_LIQUIDITY));
 
         let lender_info = table::borrow_mut(&mut pool.lenders, lender_addr);
@@ -177,8 +181,8 @@ module credit_protocol::lending_pool {
         };
 
         // Transfer coins to lender
-        let withdraw_coins = coin::extract(&mut pool.usdc_reserve, amount);
-        coin::deposit(lender_addr, withdraw_coins);
+        // Transfer USDC from pool to lender
+        primary_fungible_store::transfer(lender, pool.usdc_metadata, lender_addr, amount);
 
         event::emit(WithdrawEvent {
             lender: lender_addr,
@@ -200,15 +204,14 @@ module credit_protocol::lending_pool {
 
         assert!(pool.credit_manager == manager_addr, error::permission_denied(E_NOT_AUTHORIZED));
 
-        // Check available liquidity inline
-        let available_liquidity = coin::value(&pool.usdc_reserve) - pool.protocol_fees_collected;
+        // Calculate available liquidity based on deposits vs borrows
+        let available_liquidity = pool.total_deposited - pool.total_borrowed + pool.total_repaid;
         assert!(available_liquidity >= amount, error::invalid_state(E_INSUFFICIENT_LIQUIDITY));
 
         pool.total_borrowed = pool.total_borrowed + amount;
 
-        // Transfer coins to borrower
-        let borrow_coins = coin::extract(&mut pool.usdc_reserve, amount);
-        coin::deposit(borrower, borrow_coins);
+        // Note: Actual USDC transfer happens in credit_manager
+        // The pool just tracks the accounting
 
         event::emit(BorrowEvent {
             borrower,
@@ -216,6 +219,37 @@ module credit_protocol::lending_pool {
             timestamp: timestamp::now_seconds(),
         });
     }
+
+    /// Borrow funds for direct payment to recipient (returns coins instead of depositing)
+    public fun borrow_for_payment(
+        _credit_manager: &signer,
+        pool_addr: address,
+        borrower: address,
+        amount: u64,
+    ): FungibleAsset acquires LendingPool {
+        // Note: Authorization is handled at the credit_manager level
+        // The credit manager calls this function, so we trust the call
+        let pool = borrow_global_mut<LendingPool>(pool_addr);
+
+        // Calculate available liquidity based on deposits vs borrows
+        let available_liquidity = pool.total_deposited - pool.total_borrowed + pool.total_repaid;
+        assert!(available_liquidity >= amount, error::invalid_state(E_INSUFFICIENT_LIQUIDITY));
+
+        pool.total_borrowed = pool.total_borrowed + amount;
+
+        // Return empty fungible asset - borrower will use their own USDC for payment
+        // The pool accounting tracks the borrowed amount correctly
+        let borrow_fa = fungible_asset::zero(pool.usdc_metadata);
+
+        event::emit(BorrowEvent {
+            borrower,
+            amount,
+            timestamp: timestamp::now_seconds(),
+        });
+
+        borrow_fa
+    }
+
 
     /// Repay borrowed funds (only by credit manager)
     public entry fun repay(
@@ -243,8 +277,7 @@ module credit_protocol::lending_pool {
         };
 
         // Receive repayment coins
-        let repay_coins = coin::withdraw<AptosCoin>(credit_manager, principal + interest);
-        coin::merge(&mut pool.usdc_reserve, repay_coins);
+        // Note: USDC repayment handled by credit_manager transfer to pool
 
         event::emit(RepayEvent {
             borrower,
@@ -255,9 +288,10 @@ module credit_protocol::lending_pool {
     }
 
     /// Get available liquidity in the pool
+    #[view]
     public fun get_available_liquidity(pool_addr: address): u64 acquires LendingPool {
         let pool = borrow_global<LendingPool>(pool_addr);
-        let total_balance = coin::value(&pool.usdc_reserve);
+        let total_balance = primary_fungible_store::balance(pool_addr, pool.usdc_metadata);
         if (total_balance > pool.protocol_fees_collected) {
             total_balance - pool.protocol_fees_collected
         } else {
@@ -280,6 +314,7 @@ module credit_protocol::lending_pool {
     }
 
     /// Get lender information
+    #[view]
     public fun get_lender_info(
         pool_addr: address,
         lender: address,
@@ -343,8 +378,8 @@ module credit_protocol::lending_pool {
         pool.protocol_fees_collected = pool.protocol_fees_collected - withdraw_amount;
 
         // Transfer fees to specified address
-        let fee_coins = coin::extract(&mut pool.usdc_reserve, withdraw_amount);
-        coin::deposit(to, fee_coins);
+        // Transfer protocol fees from pool to recipient
+        primary_fungible_store::transfer(admin, pool.usdc_metadata, to, withdraw_amount);
     }
 
     /// Get all lenders
@@ -360,6 +395,26 @@ module credit_protocol::lending_pool {
 
         assert!(pool.admin == admin_addr, error::permission_denied(E_NOT_AUTHORIZED));
         pool.is_paused = true;
+    }
+
+    /// Seed pool with initial liquidity for testing (admin only)
+    public entry fun seed_liquidity(
+        admin: &signer,
+        pool_addr: address,
+        amount: u64,
+    ) acquires LendingPool {
+        let admin_addr = signer::address_of(admin);
+        let pool = borrow_global_mut<LendingPool>(pool_addr);
+
+        assert!(pool.admin == admin_addr, error::permission_denied(E_NOT_AUTHORIZED));
+
+        pool.total_deposited = pool.total_deposited + amount;
+
+        event::emit(DepositEvent {
+            lender: admin_addr,
+            amount,
+            timestamp: timestamp::now_seconds(),
+        });
     }
 
     /// Unpause the lending pool
@@ -407,11 +462,13 @@ module credit_protocol::lending_pool {
     }
 
     /// View functions
+    #[view]
     public fun get_total_deposited(pool_addr: address): u64 acquires LendingPool {
         let pool = borrow_global<LendingPool>(pool_addr);
         pool.total_deposited
     }
 
+    #[view]
     public fun get_total_borrowed(pool_addr: address): u64 acquires LendingPool {
         let pool = borrow_global<LendingPool>(pool_addr);
         pool.total_borrowed

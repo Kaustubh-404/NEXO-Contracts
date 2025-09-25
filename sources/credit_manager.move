@@ -5,8 +5,9 @@ module credit_protocol::credit_manager {
     use std::string::{Self, String};
     use aptos_framework::timestamp;
     use aptos_framework::event;
-    use aptos_framework::coin::{Self, Coin};
-    use aptos_framework::aptos_coin::AptosCoin;
+    use aptos_framework::fungible_asset::{Self, FungibleAsset, Metadata};
+    use aptos_framework::object::{Self, Object};
+    use aptos_framework::primary_fungible_store;
     use aptos_framework::account;
     use aptos_framework::table::{Self, Table};
 
@@ -28,6 +29,11 @@ module credit_protocol::credit_manager {
     const E_LIQUIDATION_NOT_ALLOWED: u64 = 9;
     const E_ALREADY_INITIALIZED: u64 = 10;
     const E_INVALID_ADDRESS: u64 = 11;
+    const E_PREAUTH_EXISTS: u64 = 12;
+    const E_PREAUTH_NOT_FOUND: u64 = 13;
+    const E_PREAUTH_EXPIRED: u64 = 14;
+    const E_PREAUTH_EXCEEDED: u64 = 15;
+    const E_PREAUTH_INACTIVE: u64 = 16;
 
     /// Constants
     const BASIS_POINTS: u256 = 10000;
@@ -35,6 +41,9 @@ module credit_protocol::credit_manager {
     const GRACE_PERIOD: u64 = 2592000; // 30 days
     const MAX_LTV: u256 = 10000; // 100%
     const LIQUIDATION_THRESHOLD: u256 = 11000; // 110%
+
+    /// USDC Metadata Object Address on Aptos Testnet
+    const USDC_METADATA_ADDRESS: address = @0x69091fbab5f7d635ee7ac5098cf0c1efbe31d68fec0f2cd565e8d168daf52832;
 
     /// Credit line structure
     struct CreditLine has copy, store, drop {
@@ -51,6 +60,16 @@ module credit_protocol::credit_manager {
         late_repayments: u64,
     }
 
+    /// Pre-authorization structure for instant payments (credit card-like UX)
+    struct PreAuthorization has copy, store, drop {
+        total_limit: u64,           // Total spending limit (USDC units)
+        per_tx_limit: u64,          // Per transaction limit (USDC units)
+        used_amount: u64,           // Already spent amount
+        expires_at: u64,            // Expiration timestamp
+        is_active: bool,            // Can be paused/resumed
+        created_at: u64,            // Creation timestamp
+    }
+
     /// Credit manager resource
     struct CreditManager has key {
         admin: address,
@@ -63,7 +82,8 @@ module credit_protocol::credit_manager {
         credit_increase_multiplier: u256, // basis points
         credit_lines: Table<address, CreditLine>,
         borrowers_list: vector<address>,
-        collateral_reserve: Coin<AptosCoin>, // For handling collateral transfers
+        pre_authorizations: Table<address, PreAuthorization>, // Pre-auth for instant payments
+        usdc_metadata: Object<Metadata>, // USDC metadata object
         is_paused: bool,
     }
 
@@ -79,6 +99,16 @@ module credit_protocol::credit_manager {
     #[event]
     struct BorrowedEvent has drop, store {
         borrower: address,
+        amount: u64,
+        total_borrowed: u64,
+        due_date: u64,
+        timestamp: u64,
+    }
+
+    #[event]
+    struct DirectPaymentEvent has drop, store {
+        borrower: address,
+        recipient: address,
         amount: u64,
         total_borrowed: u64,
         due_date: u64,
@@ -121,6 +151,24 @@ module credit_protocol::credit_manager {
         timestamp: u64,
     }
 
+    #[event]
+    struct PreAuthSetupEvent has drop, store {
+        borrower: address,
+        total_limit: u64,
+        per_tx_limit: u64,
+        expires_at: u64,
+        timestamp: u64,
+    }
+
+    #[event]
+    struct InstantPaymentEvent has drop, store {
+        borrower: address,
+        recipient: address,
+        amount: u64,
+        remaining_preauth: u64,
+        timestamp: u64,
+    }
+
     /// Initialize the credit manager
     public entry fun initialize(
         admin: &signer,
@@ -144,7 +192,8 @@ module credit_protocol::credit_manager {
             credit_increase_multiplier: 1200, // 20% increase
             credit_lines: table::new(),
             borrowers_list: vector::empty(),
-            collateral_reserve: coin::zero<AptosCoin>(),
+            pre_authorizations: table::new(),
+            usdc_metadata: object::address_to_object<Metadata>(USDC_METADATA_ADDRESS),
             is_paused: false,
         };
 
@@ -167,9 +216,8 @@ module credit_protocol::credit_manager {
             error::already_exists(E_CREDIT_LINE_EXISTS)
         );
 
-        // Transfer collateral from borrower to manager
-        let collateral_coins = coin::withdraw<AptosCoin>(borrower, collateral_amount);
-        coin::merge(&mut manager.collateral_reserve, collateral_coins);
+        // Transfer collateral from borrower to vault (USDC)
+        primary_fungible_store::transfer(borrower, manager.usdc_metadata, manager.collateral_vault_addr, collateral_amount);
 
         // Deposit collateral to vault (in practice, this would call the vault module)
         // For now, we'll assume the collateral is managed internally
@@ -220,9 +268,8 @@ module credit_protocol::credit_manager {
         let credit_line = table::borrow_mut(&mut manager.credit_lines, borrower_addr);
         assert!(credit_line.is_active, error::invalid_state(E_CREDIT_LINE_NOT_ACTIVE));
 
-        // Transfer additional collateral
-        let collateral_coins = coin::withdraw<AptosCoin>(borrower, collateral_amount);
-        coin::merge(&mut manager.collateral_reserve, collateral_coins);
+        // Transfer additional collateral (USDC)
+        primary_fungible_store::transfer(borrower, manager.usdc_metadata, manager.collateral_vault_addr, collateral_amount);
 
         // Update credit line
         credit_line.collateral_deposited = credit_line.collateral_deposited + collateral_amount;
@@ -285,6 +332,78 @@ module credit_protocol::credit_manager {
         });
     }
 
+    /// Borrow funds and pay directly to recipient (BORROWER SIGNS)
+    public entry fun borrow_and_pay(
+        borrower: &signer,
+        manager_addr: address,
+        recipient: address,
+        amount: u64,
+    ) acquires CreditManager {
+        let borrower_addr = signer::address_of(borrower);
+        let manager = borrow_global_mut<CreditManager>(manager_addr);
+
+        assert!(!manager.is_paused, error::invalid_state(E_NOT_AUTHORIZED));
+        assert!(amount > 0, error::invalid_argument(E_INVALID_AMOUNT));
+        assert!(recipient != borrower_addr, error::invalid_argument(E_INVALID_ADDRESS));
+        assert!(
+            table::contains(&manager.credit_lines, borrower_addr),
+            error::not_found(E_CREDIT_LINE_NOT_ACTIVE)
+        );
+
+        // Execute signed payment (borrower must approve)
+        execute_standard_payment(borrower, manager, borrower_addr, recipient, amount);
+    }
+
+
+    /// Execute standard payment (original flow)
+    fun execute_standard_payment(
+        borrower: &signer,
+        manager: &mut CreditManager,
+        borrower_addr: address,
+        recipient: address,
+        amount: u64,
+    ) {
+        // Update interest before borrowing
+        update_interest_internal(manager, borrower_addr);
+
+        let credit_line = table::borrow_mut(&mut manager.credit_lines, borrower_addr);
+        assert!(credit_line.is_active, error::invalid_state(E_CREDIT_LINE_NOT_ACTIVE));
+
+        let total_debt = credit_line.borrowed_amount + credit_line.interest_accrued;
+        assert!(
+            total_debt + amount <= credit_line.credit_limit,
+            error::invalid_state(E_EXCEEDS_CREDIT_LIMIT)
+        );
+
+        // Check lending pool approval and update accounting
+        let _borrowed_usdc = lending_pool::borrow_for_payment(
+            borrower,
+            manager.lending_pool_addr,
+            borrower_addr,
+            amount
+        );
+
+        // Destroy empty fungible asset
+        fungible_asset::destroy_zero(_borrowed_usdc);
+
+        // Transfer USDC from lending pool directly to recipient
+        primary_fungible_store::transfer(borrower, manager.usdc_metadata, recipient, amount);
+
+        // Update credit line
+        credit_line.borrowed_amount = credit_line.borrowed_amount + amount;
+        credit_line.last_borrowed_timestamp = timestamp::now_seconds();
+        credit_line.repayment_due_date = timestamp::now_seconds() + GRACE_PERIOD + 2592000;
+
+        event::emit(DirectPaymentEvent {
+            borrower: borrower_addr,
+            recipient,
+            amount,
+            total_borrowed: credit_line.borrowed_amount,
+            due_date: credit_line.repayment_due_date,
+            timestamp: timestamp::now_seconds(),
+        });
+    }
+
     /// Repay loan
     public entry fun repay(
         borrower: &signer,
@@ -322,8 +441,8 @@ module credit_protocol::credit_manager {
         let total_repayment = principal_amount + interest_amount;
 
         // Transfer repayment from borrower (this would go through lending pool)
-        let repayment_coins = coin::withdraw<AptosCoin>(borrower, total_repayment);
-        coin::merge(&mut manager.collateral_reserve, repayment_coins);
+        // Transfer repayment (USDC) from borrower to lending pool
+        primary_fungible_store::transfer(borrower, manager.usdc_metadata, manager.lending_pool_addr, total_repayment);
 
         // Update credit line
         credit_line.borrowed_amount = credit_line.borrowed_amount - principal_amount;
@@ -422,6 +541,7 @@ module credit_protocol::credit_manager {
     }
 
     /// Get credit information for a borrower
+    #[view]
     public fun get_credit_info(
         manager_addr: address,
         borrower: address,
@@ -448,6 +568,7 @@ module credit_protocol::credit_manager {
     }
 
     /// Get repayment history for a borrower
+    #[view]
     public fun get_repayment_history(
         manager_addr: address,
         borrower: address,
@@ -497,6 +618,7 @@ module credit_protocol::credit_manager {
     }
 
     /// Get all borrowers
+    #[view]
     public fun get_all_borrowers(manager_addr: address): vector<address> acquires CreditManager {
         let manager = borrow_global<CreditManager>(manager_addr);
         manager.borrowers_list
@@ -635,22 +757,171 @@ module credit_protocol::credit_manager {
         };
     }
 
+    // =================================================================================
+    // PRE-AUTHORIZATION FUNCTIONS FOR INSTANT PAYMENTS (CREDIT CARD-LIKE UX)
+    // =================================================================================
+
+    /// Setup pre-authorization for instant payments (one-time setup like getting a credit card)
+    public entry fun setup_pre_authorization(
+        borrower: &signer,
+        manager_addr: address,
+        total_limit: u64,          // e.g., 5000 USDC (in USDC units with 6 decimals)
+        per_tx_limit: u64,         // e.g., 500 USDC (in USDC units)
+        duration_hours: u64,       // e.g., 24 hours
+    ) acquires CreditManager {
+        let borrower_addr = signer::address_of(borrower);
+        let manager = borrow_global_mut<CreditManager>(manager_addr);
+
+        assert!(!manager.is_paused, error::invalid_state(E_NOT_AUTHORIZED));
+        assert!(total_limit > 0, error::invalid_argument(E_INVALID_AMOUNT));
+        assert!(per_tx_limit > 0, error::invalid_argument(E_INVALID_AMOUNT));
+        assert!(per_tx_limit <= total_limit, error::invalid_argument(E_INVALID_AMOUNT));
+        assert!(duration_hours > 0 && duration_hours <= 168, error::invalid_argument(E_INVALID_AMOUNT)); // Max 7 days
+
+        // Must have active credit line
+        assert!(
+            table::contains(&manager.credit_lines, borrower_addr),
+            error::not_found(E_CREDIT_LINE_NOT_ACTIVE)
+        );
+
+        let credit_line = table::borrow(&manager.credit_lines, borrower_addr);
+        assert!(credit_line.is_active, error::invalid_state(E_CREDIT_LINE_NOT_ACTIVE));
+
+        // Total limit cannot exceed available credit
+        let total_debt = credit_line.borrowed_amount + credit_line.interest_accrued;
+        let available_credit = credit_line.credit_limit - total_debt;
+        assert!(total_limit <= available_credit, error::invalid_state(E_EXCEEDS_CREDIT_LIMIT));
+
+        let now = timestamp::now_seconds();
+        let expires_at = now + (duration_hours * 3600); // Convert hours to seconds
+
+        // Remove existing pre-auth if it exists
+        if (table::contains(&manager.pre_authorizations, borrower_addr)) {
+            table::remove(&mut manager.pre_authorizations, borrower_addr);
+        };
+
+        let pre_auth = PreAuthorization {
+            total_limit,
+            per_tx_limit,
+            used_amount: 0,
+            expires_at,
+            is_active: true,
+            created_at: now,
+        };
+
+        table::add(&mut manager.pre_authorizations, borrower_addr, pre_auth);
+
+        event::emit(PreAuthSetupEvent {
+            borrower: borrower_addr,
+            total_limit,
+            per_tx_limit,
+            expires_at,
+            timestamp: now,
+        });
+    }
+
+    /// Update pre-authorization limits
+    public entry fun update_pre_auth_limits(
+        borrower: &signer,
+        manager_addr: address,
+        new_total_limit: u64,
+        new_per_tx_limit: u64,
+    ) acquires CreditManager {
+        let borrower_addr = signer::address_of(borrower);
+        let manager = borrow_global_mut<CreditManager>(manager_addr);
+
+        assert!(!manager.is_paused, error::invalid_state(E_NOT_AUTHORIZED));
+        assert!(
+            table::contains(&manager.pre_authorizations, borrower_addr),
+            error::not_found(E_PREAUTH_NOT_FOUND)
+        );
+
+        let pre_auth = table::borrow_mut(&mut manager.pre_authorizations, borrower_addr);
+        assert!(pre_auth.is_active, error::invalid_state(E_PREAUTH_INACTIVE));
+        assert!(timestamp::now_seconds() < pre_auth.expires_at, error::invalid_state(E_PREAUTH_EXPIRED));
+
+        pre_auth.total_limit = new_total_limit;
+        pre_auth.per_tx_limit = new_per_tx_limit;
+    }
+
+    /// Toggle pre-authorization active status (pause/resume instant payments)
+    public entry fun toggle_pre_authorization(
+        borrower: &signer,
+        manager_addr: address,
+        enable: bool,
+    ) acquires CreditManager {
+        let borrower_addr = signer::address_of(borrower);
+        let manager = borrow_global_mut<CreditManager>(manager_addr);
+
+        assert!(
+            table::contains(&manager.pre_authorizations, borrower_addr),
+            error::not_found(E_PREAUTH_NOT_FOUND)
+        );
+
+        let pre_auth = table::borrow_mut(&mut manager.pre_authorizations, borrower_addr);
+        pre_auth.is_active = enable;
+    }
+
+    /// Check if user has valid pre-authorization for amount
+    fun has_valid_pre_authorization(manager: &CreditManager, borrower: address, amount: u64): bool {
+        if (!table::contains(&manager.pre_authorizations, borrower)) {
+            return false
+        };
+
+        let pre_auth = table::borrow(&manager.pre_authorizations, borrower);
+        let now = timestamp::now_seconds();
+
+        // Check all conditions
+        pre_auth.is_active &&
+        now < pre_auth.expires_at &&
+        amount <= pre_auth.per_tx_limit &&
+        pre_auth.used_amount + amount <= pre_auth.total_limit
+    }
+
+    /// Update used amount in pre-authorization
+    fun update_pre_auth_usage(manager: &mut CreditManager, borrower: address, amount: u64) {
+        let pre_auth = table::borrow_mut(&mut manager.pre_authorizations, borrower);
+        pre_auth.used_amount = pre_auth.used_amount + amount;
+    }
+
+    /// View function to get pre-authorization status
+    #[view]
+    public fun get_pre_auth_status(manager_addr: address, borrower: address): (u64, u64, u64, u64, bool) acquires CreditManager {
+        let manager = borrow_global<CreditManager>(manager_addr);
+
+        if (!table::contains(&manager.pre_authorizations, borrower)) {
+            return (0, 0, 0, 0, false)
+        };
+
+        let pre_auth = table::borrow(&manager.pre_authorizations, borrower);
+        (
+            pre_auth.total_limit,
+            pre_auth.used_amount,
+            pre_auth.expires_at,
+            pre_auth.per_tx_limit,
+            pre_auth.is_active
+        )
+    }
+
     /// View functions
     public fun is_paused(manager_addr: address): bool acquires CreditManager {
         let manager = borrow_global<CreditManager>(manager_addr);
         manager.is_paused
     }
 
+    #[view]
     public fun get_admin(manager_addr: address): address acquires CreditManager {
         let manager = borrow_global<CreditManager>(manager_addr);
         manager.admin
     }
 
+    #[view]
     public fun get_lending_pool_addr(manager_addr: address): address acquires CreditManager {
         let manager = borrow_global<CreditManager>(manager_addr);
         manager.lending_pool_addr
     }
 
+    #[view]
     public fun get_fixed_interest_rate(manager_addr: address): u256 acquires CreditManager {
         let manager = borrow_global<CreditManager>(manager_addr);
         manager.fixed_interest_rate

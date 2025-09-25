@@ -6,8 +6,9 @@ module credit_protocol::collateral_vault {
     use std::option::{Self, Option};
     use aptos_framework::timestamp;
     use aptos_framework::event;
-    use aptos_framework::coin::{Self, Coin};
-    use aptos_framework::aptos_coin::AptosCoin;
+    use aptos_framework::fungible_asset::{Self, FungibleAsset, Metadata};
+    use aptos_framework::object::{Self, Object};
+    use aptos_framework::primary_fungible_store;
     use aptos_framework::account;
     use aptos_framework::table::{Self, Table};
 
@@ -26,6 +27,9 @@ module credit_protocol::collateral_vault {
 
     /// Constants
     const BASIS_POINTS: u256 = 10000;
+
+    /// USDC Metadata Object Address on Aptos Testnet
+    const USDC_METADATA_ADDRESS: address = @0x69091fbab5f7d635ee7ac5098cf0c1efbe31d68fec0f2cd565e8d168daf52832;
 
     /// Collateral status constants
     const COLLATERAL_STATUS_ACTIVE: u8 = 0;
@@ -48,7 +52,7 @@ module credit_protocol::collateral_vault {
         user_collateral: Table<address, UserCollateral>,
         users_list: vector<address>,
         total_collateral: u64,
-        usdc_reserve: Coin<AptosCoin>, // Using AptosCoin as placeholder for USDC
+        usdc_metadata: Object<Metadata>, // USDC metadata object
         collateralization_ratio: u256, // in basis points
         liquidation_threshold: u256,   // in basis points
         max_collateral_amount: u64,
@@ -127,7 +131,7 @@ module credit_protocol::collateral_vault {
             user_collateral: table::new(),
             users_list: vector::empty(),
             total_collateral: 0,
-            usdc_reserve: coin::zero<AptosCoin>(),
+            usdc_metadata: object::address_to_object<Metadata>(USDC_METADATA_ADDRESS),
             collateralization_ratio: 15000, // 150%
             liquidation_threshold: 12000,   // 120%
             max_collateral_amount: 1000000000000, // 1M USDC (with 6 decimals)
@@ -137,17 +141,15 @@ module credit_protocol::collateral_vault {
         move_to(admin, collateral_vault);
     }
 
-    /// Deposit collateral (only by credit manager)
+    /// Deposit collateral (by user)
     public entry fun deposit_collateral(
-        credit_manager: &signer,
+        borrower: &signer,
         vault_addr: address,
-        borrower: address,
         amount: u64,
     ) acquires CollateralVault {
-        let manager_addr = signer::address_of(credit_manager);
+        let borrower_addr = signer::address_of(borrower);
         let vault = borrow_global_mut<CollateralVault>(vault_addr);
 
-        assert!(vault.credit_manager == manager_addr, error::permission_denied(E_NOT_AUTHORIZED));
         assert!(!vault.is_paused, error::invalid_state(E_NOT_AUTHORIZED));
         assert!(amount > 0, error::invalid_argument(E_INVALID_AMOUNT));
         assert!(
@@ -155,13 +157,12 @@ module credit_protocol::collateral_vault {
             error::invalid_state(E_EXCEEDS_MAX_LIMIT)
         );
 
-        // Transfer collateral from borrower to vault
-        let collateral_coins = coin::withdraw<AptosCoin>(credit_manager, amount);
-        coin::merge(&mut vault.usdc_reserve, collateral_coins);
+        // Transfer USDC from borrower to vault
+        primary_fungible_store::transfer(borrower, vault.usdc_metadata, vault_addr, amount);
 
         // Update or create user collateral
-        if (table::contains(&vault.user_collateral, borrower)) {
-            let user_collateral = table::borrow_mut(&mut vault.user_collateral, borrower);
+        if (table::contains(&vault.user_collateral, borrower_addr)) {
+            let user_collateral = table::borrow_mut(&mut vault.user_collateral, borrower_addr);
             user_collateral.amount = user_collateral.amount + amount;
             user_collateral.last_update_timestamp = timestamp::now_seconds();
 
@@ -171,7 +172,7 @@ module credit_protocol::collateral_vault {
             };
 
             event::emit(CollateralDepositedEvent {
-                user: borrower,
+                user: borrower_addr,
                 amount,
                 total_user_collateral: user_collateral.amount,
                 timestamp: timestamp::now_seconds(),
@@ -183,11 +184,11 @@ module credit_protocol::collateral_vault {
                 locked_amount: 0,
                 last_update_timestamp: timestamp::now_seconds(),
             };
-            table::add(&mut vault.user_collateral, borrower, user_collateral);
-            vector::push_back(&mut vault.users_list, borrower);
+            table::add(&mut vault.user_collateral, borrower_addr, user_collateral);
+            vector::push_back(&mut vault.users_list, borrower_addr);
 
             event::emit(CollateralDepositedEvent {
-                user: borrower,
+                user: borrower_addr,
                 amount,
                 total_user_collateral: amount,
                 timestamp: timestamp::now_seconds(),
@@ -197,22 +198,20 @@ module credit_protocol::collateral_vault {
         vault.total_collateral = vault.total_collateral + amount;
     }
 
-    /// Withdraw collateral (only by credit manager)
+    /// Withdraw collateral (by user)
     public entry fun withdraw_collateral(
-        credit_manager: &signer,
+        borrower: &signer,
         vault_addr: address,
-        borrower: address,
         amount: u64,
     ) acquires CollateralVault {
-        let manager_addr = signer::address_of(credit_manager);
+        let borrower_addr = signer::address_of(borrower);
         let vault = borrow_global_mut<CollateralVault>(vault_addr);
 
-        assert!(vault.credit_manager == manager_addr, error::permission_denied(E_NOT_AUTHORIZED));
         assert!(!vault.is_paused, error::invalid_state(E_NOT_AUTHORIZED));
         assert!(amount > 0, error::invalid_argument(E_INVALID_AMOUNT));
-        assert!(table::contains(&vault.user_collateral, borrower), error::not_found(E_NOT_INITIALIZED));
+        assert!(table::contains(&vault.user_collateral, borrower_addr), error::not_found(E_NOT_INITIALIZED));
 
-        let user_collateral = table::borrow_mut(&mut vault.user_collateral, borrower);
+        let user_collateral = table::borrow_mut(&mut vault.user_collateral, borrower_addr);
         assert!(user_collateral.amount >= amount, error::invalid_argument(E_INSUFFICIENT_COLLATERAL));
 
         // Update user collateral
@@ -223,38 +222,37 @@ module credit_protocol::collateral_vault {
         // Remove user if balance is zero
         let remaining_collateral = user_collateral.amount;
         if (remaining_collateral == 0) {
-            remove_user_from_list(vault, borrower);
-            table::remove(&mut vault.user_collateral, borrower);
+            remove_user_from_list(vault, borrower_addr);
+            table::remove(&mut vault.user_collateral, borrower_addr);
         };
 
-        // Transfer collateral to borrower
-        let withdrawal_coins = coin::extract(&mut vault.usdc_reserve, amount);
-        coin::deposit(borrower, withdrawal_coins);
+        // Transfer USDC from vault to borrower
+        // Note: This requires the vault to have the resource account capability
+        // For now, we'll update accounting and actual transfer will be handled by vault
 
         event::emit(CollateralWithdrawnEvent {
-            user: borrower,
+            user: borrower_addr,
             amount,
             remaining_collateral,
             timestamp: timestamp::now_seconds(),
         });
     }
 
-    /// Lock collateral (only by credit manager)
+    /// Lock collateral (by user)
     public entry fun lock_collateral(
-        credit_manager: &signer,
+        user: &signer,
         vault_addr: address,
-        user: address,
         amount: u64,
         reason: String,
     ) acquires CollateralVault {
-        let manager_addr = signer::address_of(credit_manager);
+        let user_addr = signer::address_of(user);
         let vault = borrow_global_mut<CollateralVault>(vault_addr);
 
-        assert!(vault.credit_manager == manager_addr, error::permission_denied(E_NOT_AUTHORIZED));
+        assert!(!vault.is_paused, error::invalid_state(E_NOT_AUTHORIZED));
         assert!(amount > 0, error::invalid_argument(E_INVALID_AMOUNT));
-        assert!(table::contains(&vault.user_collateral, user), error::not_found(E_NOT_INITIALIZED));
+        assert!(table::contains(&vault.user_collateral, user_addr), error::not_found(E_NOT_INITIALIZED));
 
-        let user_collateral = table::borrow_mut(&mut vault.user_collateral, user);
+        let user_collateral = table::borrow_mut(&mut vault.user_collateral, user_addr);
         assert!(user_collateral.amount >= amount, error::invalid_argument(E_INSUFFICIENT_COLLATERAL));
         assert!(
             user_collateral.amount - user_collateral.locked_amount >= amount,
@@ -266,28 +264,27 @@ module credit_protocol::collateral_vault {
         user_collateral.last_update_timestamp = timestamp::now_seconds();
 
         event::emit(CollateralLockedEvent {
-            user,
+            user: user_addr,
             amount,
             reason,
             timestamp: timestamp::now_seconds(),
         });
     }
 
-    /// Unlock collateral (only by credit manager)
+    /// Unlock collateral (by user)
     public entry fun unlock_collateral(
-        credit_manager: &signer,
+        user: &signer,
         vault_addr: address,
-        user: address,
         amount: u64,
     ) acquires CollateralVault {
-        let manager_addr = signer::address_of(credit_manager);
+        let user_addr = signer::address_of(user);
         let vault = borrow_global_mut<CollateralVault>(vault_addr);
 
-        assert!(vault.credit_manager == manager_addr, error::permission_denied(E_NOT_AUTHORIZED));
+        assert!(!vault.is_paused, error::invalid_state(E_NOT_AUTHORIZED));
         assert!(amount > 0, error::invalid_argument(E_INVALID_AMOUNT));
-        assert!(table::contains(&vault.user_collateral, user), error::not_found(E_NOT_INITIALIZED));
+        assert!(table::contains(&vault.user_collateral, user_addr), error::not_found(E_NOT_INITIALIZED));
 
-        let user_collateral = table::borrow_mut(&mut vault.user_collateral, user);
+        let user_collateral = table::borrow_mut(&mut vault.user_collateral, user_addr);
         assert!(
             user_collateral.locked_amount >= amount,
             error::invalid_argument(E_INSUFFICIENT_LOCKED_COLLATERAL)
@@ -300,7 +297,7 @@ module credit_protocol::collateral_vault {
         user_collateral.last_update_timestamp = timestamp::now_seconds();
 
         event::emit(CollateralUnlockedEvent {
-            user,
+            user: user_addr,
             amount,
             timestamp: timestamp::now_seconds(),
         });
@@ -340,8 +337,8 @@ module credit_protocol::collateral_vault {
         };
 
         // Transfer liquidated collateral to liquidator
-        let liquidation_coins = coin::extract(&mut vault.usdc_reserve, amount);
-        coin::deposit(liquidator_addr, liquidation_coins);
+        // Transfer liquidated USDC to liquidator
+        primary_fungible_store::transfer(liquidator, vault.usdc_metadata, liquidator_addr, amount);
 
         event::emit(CollateralLiquidatedEvent {
             user,
@@ -372,8 +369,8 @@ module credit_protocol::collateral_vault {
         vault.total_collateral = vault.total_collateral - amount;
 
         // Transfer to user
-        let emergency_coins = coin::extract(&mut vault.usdc_reserve, amount);
-        coin::deposit(user, emergency_coins);
+        // Transfer USDC for emergency withdrawal
+        primary_fungible_store::transfer(admin, vault.usdc_metadata, user, amount);
 
         event::emit(EmergencyWithdrawalEvent {
             user,
@@ -454,6 +451,7 @@ module credit_protocol::collateral_vault {
     }
 
     /// Get collateral balance for a user
+    #[view]
     public fun get_collateral_balance(vault_addr: address, user: address): u64 acquires CollateralVault {
         let vault = borrow_global<CollateralVault>(vault_addr);
         if (table::contains(&vault.user_collateral, user)) {

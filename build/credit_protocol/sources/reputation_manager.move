@@ -123,21 +123,16 @@ module credit_protocol::reputation_manager {
 
     /// Initialize a user in the reputation system
     public entry fun initialize_user(
-        credit_manager: &signer,
+        user: &signer,
         manager_addr: address,
-        user: address,
     ) acquires ReputationManager {
-        let manager_addr_signer = signer::address_of(credit_manager);
+        let user_addr = signer::address_of(user);
         let rep_manager = borrow_global_mut<ReputationManager>(manager_addr);
 
-        assert!(
-            rep_manager.credit_manager == manager_addr_signer,
-            error::permission_denied(E_NOT_AUTHORIZED)
-        );
         assert!(!rep_manager.is_paused, error::invalid_state(E_NOT_AUTHORIZED));
-        assert!(user != @0x0, error::invalid_argument(E_INVALID_ADDRESS));
+        assert!(user_addr != @0x0, error::invalid_argument(E_INVALID_ADDRESS));
         assert!(
-            !table::contains(&rep_manager.reputations, user),
+            !table::contains(&rep_manager.reputations, user_addr),
             error::already_exists(E_USER_ALREADY_INITIALIZED)
         );
 
@@ -154,11 +149,11 @@ module credit_protocol::reputation_manager {
             is_initialized: true,
         };
 
-        table::add(&mut rep_manager.reputations, user, reputation_data);
-        vector::push_back(&mut rep_manager.users_list, user);
+        table::add(&mut rep_manager.reputations, user_addr, reputation_data);
+        vector::push_back(&mut rep_manager.users_list, user_addr);
 
         event::emit(UserInitializedEvent {
-            user,
+            user: user_addr,
             initial_score: DEFAULT_SCORE,
             initial_tier,
             timestamp: timestamp::now_seconds(),
